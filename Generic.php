@@ -9,6 +9,8 @@ use Magento\Framework\Exception\LocalizedException;
 use StripeIntegration\Payments\Exception\GenericException;
 use StripeIntegration\Payments\Exception\PaymentMethodInUse;
 use StripeIntegration\Payments\Exception\InvalidPaymentMethod;
+use Magento\Integration\Model\Oauth\TokenFactory;
+use Magento\Quote\Api\CartRepositoryInterface;
 
 class Generic
 {
@@ -61,6 +63,8 @@ class Generic
     private $checkoutFlow;
     private $currencyHelper;
     private $errorHelper;
+    private $tokenFactory;
+    private $cartRepository;
     private $config = null;
 
     public function __construct(
@@ -110,7 +114,9 @@ class Generic
         \StripeIntegration\Payments\Model\Stripe\PaymentMethodFactory $stripePaymentMethodFactory,
         \StripeIntegration\Payments\Helper\Error $errorHelper,
         \StripeIntegration\Payments\Model\StripeCustomerFactory $stripeCustomerModelFactory,
-        \StripeIntegration\Payments\Model\Checkout\Flow $checkoutFlow
+        \StripeIntegration\Payments\Model\Checkout\Flow $checkoutFlow,
+        \Magento\Integration\Model\Oauth\TokenFactory $tokenFactory,
+        \Magento\Quote\Api\CartRepositoryInterface $cartRepository
     ) {
         $this->scopeConfig = $scopeConfig;
         $this->backendSessionQuote = $backendSessionQuote;
@@ -159,6 +165,8 @@ class Generic
         $this->tokenHelper = $tokenHelper;
         $this->checkoutFlow = $checkoutFlow;
         $this->currencyHelper = $currencyHelper;
+        $this->tokenFactory = $tokenFactory;
+        $this->cartRepository = $cartRepository;
     }
 
     protected function getBackendSessionQuote()
@@ -245,6 +253,18 @@ class Generic
             if ($this->adminOrderAddressForm && $this->adminOrderAddressForm->getCustomerId())
                 return $this->adminOrderAddressForm->getCustomerId();
         }
+        // If we are on GraphQL API request with Bearer token
+        else if ($this->isGraphQLRequest())
+        {
+            $customerId = $this->getCustomerIdFromBearerToken();
+            if ($customerId) {
+                return $customerId;
+            }
+            // Fall back to userContext for GraphQL if no Bearer token
+            if ($this->userContext->getUserType() == UserContextInterface::USER_TYPE_CUSTOMER) {
+                return $this->userContext->getUserId();
+            }
+        }
         // If we are on the REST API
         else if ($this->userContext->getUserType() == UserContextInterface::USER_TYPE_CUSTOMER)
         {
@@ -262,6 +282,68 @@ class Generic
         }
 
         return null;
+    }
+
+    /**
+     * Extract customer ID from Bearer token in Authorization header for GraphQL requests
+     * Also sets the customer on the current quote if available
+     *
+     * @return int|null
+     */
+    private function getCustomerIdFromBearerToken()
+    {
+        try {
+            $authHeader = $this->request->getHeader('Authorization');
+
+            if ($authHeader && preg_match('/Bearer\s+(.*)$/i', $authHeader, $matches)) {
+                $tokenString = trim($matches[1]);
+                $token = $this->tokenFactory->create()->loadByToken($tokenString);
+
+                if ($token->getCustomerId()) {
+                    $customerId = $token->getCustomerId();
+
+                    // Set customer on the quote if available
+                    $this->setCustomerOnQuote($customerId);
+
+                    return $customerId;
+                }
+            }
+        } catch (\Exception $e) {
+            $this->logError('Error extracting customer ID from Bearer token: ' . $e->getMessage());
+        }
+
+        return null;
+    }
+
+    /**
+     * Set customer on the current quote for GraphQL requests
+     *
+     * @param int $customerId
+     * @return void
+     */
+    private function setCustomerOnQuote($customerId)
+    {
+        try {
+            // Get the current quote
+            $quote = $this->getSessionQuote();
+
+            if ($quote && $quote->getId()) {
+                // Load the customer
+                $customer = $this->customerRepositoryInterface->getById($customerId);
+
+                if ($customer) {
+                    // Set customer data on quote
+                    $quote->setCustomer($customer);
+                    $quote->setCustomerIsGuest(false);
+                    $quote->setCustomerEmail($customer->getEmail());
+
+                    // Save the quote
+                    $this->cartRepository->save($quote);
+                }
+            }
+        } catch (\Exception $e) {
+            $this->logError('Error setting customer on quote: ' . $e->getMessage());
+        }
     }
 
     public function getMagentoCustomer()
