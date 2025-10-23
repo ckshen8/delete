@@ -52,7 +52,6 @@ class Generic
     private $sessionManager;
     private $multishippingQuoteFactory;
     private $productMetadata;
-    private $restController;
     private $logger;
     private $configFactory;
     private $stripePaymentMethodFactory;
@@ -61,6 +60,7 @@ class Generic
     private $tokenHelper;
     private $checkoutFlow;
     private $currencyHelper;
+    private $errorHelper;
     private $config = null;
 
     public function __construct(
@@ -108,7 +108,7 @@ class Generic
         \StripeIntegration\Payments\Helper\Token $tokenHelper,
         \StripeIntegration\Payments\Model\ConfigFactory $configFactory,
         \StripeIntegration\Payments\Model\Stripe\PaymentMethodFactory $stripePaymentMethodFactory,
-        \StripeIntegration\Payments\Plugin\Webapi\Controller\Rest $restController,
+        \StripeIntegration\Payments\Helper\Error $errorHelper,
         \StripeIntegration\Payments\Model\StripeCustomerFactory $stripeCustomerModelFactory,
         \StripeIntegration\Payments\Model\Checkout\Flow $checkoutFlow
     ) {
@@ -154,7 +154,7 @@ class Generic
         $this->logger = $logger;
         $this->configFactory = $configFactory;
         $this->stripePaymentMethodFactory = $stripePaymentMethodFactory;
-        $this->restController = $restController;
+        $this->errorHelper = $errorHelper;
         $this->stripeCustomerModelFactory = $stripeCustomerModelFactory;
         $this->tokenHelper = $tokenHelper;
         $this->checkoutFlow = $checkoutFlow;
@@ -464,7 +464,7 @@ class Generic
             }
             else
             {
-                $this->restController->setDisplay(true);
+                $this->errorHelper->setDisplay(true);
                 throw new CouldNotSaveException(__($this->cleanError($msg)), $e);
             }
         }
@@ -542,8 +542,6 @@ class Generic
 
     public function cancelOrCloseOrder($order, $refundInvoices = false, $refundOffline = true)
     {
-        $canceled = false;
-
         // When in Authorize & Capture, uncaptured invoices exist, so we should cancel them first
         foreach($order->getInvoiceCollection() as $invoice)
         {
@@ -554,7 +552,6 @@ class Generic
             {
                 $invoice->cancel();
                 $this->saveInvoice($invoice);
-                $canceled = true;
             }
             else if ($refundInvoices)
             {
@@ -562,20 +559,13 @@ class Generic
                 $creditmemo->setInvoice($invoice);
                 $this->creditmemoService->refund($creditmemo, $refundOffline);
                 $this->saveCreditmemo($creditmemo);
-                $canceled = true;
             }
         }
 
-        // When there are no invoices, the order can be canceled
-        if ($order->canCancel())
-        {
-            $order->cancel();
-            $canceled = true;
-        }
-
+        // If invoices were canceled/refunded, a save is needed before canceling the order
         $this->orderHelper->saveOrder($order);
 
-        return $canceled;
+        return $this->orderHelper->cancel($order);
     }
 
     public function maskError($msg)
@@ -938,7 +928,7 @@ class Generic
                 {
                     // Case with a regular item and a subscription with PaymentElement, before the webhook arrives.
                     $humanReadableAmount = $this->currencyHelper->formatStripePrice($stripeAmount, $charge->currency);
-                    $msg = __("%1 has already captured via Stripe. The invoice was in Pending status, likely because a webhook could not be delivered to your website. Capturing %1 offline instead.", $humanReadableAmount);
+                    $msg = __("%1 was already captured via Stripe. The invoice was in Pending status, likely because a webhook could not be delivered to your website. Capturing %1 offline instead.", $humanReadableAmount);
                 }
                 else
                     $msg = __("%1 could not be captured online because it was already captured via Stripe. Capturing %1 offline instead.", $humanReadableAmount);
@@ -1112,23 +1102,6 @@ class Generic
         }
     }
 
-    public function isRecurringOrder($method)
-    {
-        try
-        {
-            $info = $method->getInfoInstance();
-
-            if (!$info)
-                return false;
-
-            return $info->getAdditionalInformation("is_recurring_subscription");
-        }
-        catch (\Exception $e)
-        {
-            return false;
-        }
-    }
-
     public function resetPaymentData($payment)
     {
         if ($payment->getPaymentId())
@@ -1167,6 +1140,8 @@ class Generic
 
     public function assignPaymentData($payment, $data)
     {
+        $config = $this->getConfig();
+
         $this->resetPaymentData($payment);
 
         if ($this->isMultiShipping())
@@ -1181,8 +1156,9 @@ class Generic
         {
             $payment->setAdditionalInformation("payment_location", "CLI migrated subscription order");
         }
-        else if (!empty($data['is_recurring_subscription']))
+        else if ($this->checkoutFlow->isRecurringSubscriptionOrderBeingPlaced)
         {
+            $payment->setAdditionalInformation("is_recurring_subscription", true);
             $payment->setAdditionalInformation("payment_location", "Recurring subscription order");
         }
         else if ($this->checkoutFlow->isExpressCheckout)
@@ -1212,8 +1188,6 @@ class Generic
 
             if (isset($data['save_payment_method']) && $data['save_payment_method'])
                 $payment->setAdditionalInformation('save_payment_method', true);
-
-            $config = $this->getConfig();
 
             if ($config->reCheckCVCForSavedCards())
             {
@@ -1248,11 +1222,19 @@ class Generic
             // Used by the express checkout element
             $payment->setAdditionalInformation('confirmation_token', $data['confirmation_token']);
         }
-        else if (!empty($data['is_recurring_subscription']))
-            $payment->setAdditionalInformation('is_recurring_subscription', $data['is_recurring_subscription']);
 
         if (!empty($data['is_migrated_subscription']))
             $payment->setAdditionalInformation('is_migrated_subscription', true);
+
+
+        // Set additional information on payment only if one of the options from the modal was selected. We determine
+        // by checking if the data coming back from JS is a string.
+        if ($config->isMsiEnabled() &&
+            !empty($data['selected_installment_plan']) &&
+            is_string($data['selected_installment_plan'])
+        ) {
+            $payment->setAdditionalInformation('selected_installment_plan', $data['selected_installment_plan']);
+        }
     }
 
     /**
@@ -1374,7 +1356,7 @@ class Generic
         if (!is_numeric($timeDifference))
         {
             $localTime = time();
-            $product = \Stripe\Product::create([
+            $product = $this->getConfig()->getStripeClient()->products->create([
                'name' => 'Time Query',
                'type' => 'service'
             ]);
@@ -1413,9 +1395,14 @@ class Generic
             if (isset($orders[$orderId]))
                 continue;
 
-            $order = $this->orderHelper->loadOrderById($orderId);
-            if ($order && $order->getId())
-                $orders[$orderId] = $order;
+            try
+            {
+                $orders[$orderId] = $this->orderHelper->loadOrderById($orderId);
+            }
+            catch (\Magento\Framework\Exception\NoSuchEntityException $e)
+            {
+                continue;
+            }
         }
 
         return $orders;
